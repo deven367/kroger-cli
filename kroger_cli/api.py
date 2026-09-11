@@ -11,13 +11,19 @@ from playwright.async_api import async_playwright
 
 
 class KrogerAPI:
+    # Path to a Chromium-family browser with a logged-in Kroger session.
+    # Override with the KROGER_BROWSER env var, or let Playwright use its own build.
     browser_options = {
         'headless': True,
-        'executable_path': '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        'executable_path': os.environ.get('KROGER_BROWSER', ''),
         'user_data_dir': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.edge-profile'),
         'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
                  '--no-sandbox']
     }
+    # Browser profile dir to copy session cookies from.
+    # Defaults to Edge's macOS location; override with KROGER_PROFILE_DIR.
+    edge_profile_dir = os.environ.get('KROGER_PROFILE_DIR',
+                                      os.path.expanduser('~/Library/Application Support/Microsoft Edge'))
     headers = {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/81.0.4044.129 Safari/537.36',
@@ -222,7 +228,7 @@ class KrogerAPI:
         return data
 
     async def init(self):
-        # Copy Edge's real profile (with saved Kroger session) to a non-default
+        # Copy the browser profile (with saved Kroger session) to a non-default
         # dir. Playwright's persistent context loads the saved cookies from there.
         self._sync_edge_profile()
         self._pw = await async_playwright().start()
@@ -238,8 +244,11 @@ class KrogerAPI:
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
     def _sync_edge_profile(self):
-        src = os.path.expanduser('~/Library/Application Support/Microsoft Edge')
+        src = self.edge_profile_dir
         dst = self.browser_options['user_data_dir']
+        if not os.path.isdir(src):
+            # No browser profile to copy — start with a fresh context (login form path).
+            return
         os.makedirs(dst, exist_ok=True)
         # Copy Cookies + login state; skip locks and caches.
         cmd = ['rsync', '-a', '--delete',
@@ -247,15 +256,24 @@ class KrogerAPI:
                '--exclude=GPUCache', '--exclude=Service Worker',
                '--exclude=*.lock', '--exclude=Singleton*',
                src + '/', dst + '/']
-        subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            self.cli.console.print('[yellow]Warning: could not copy browser profile — '
+                                   'session cookies may be missing.[/yellow]')
 
     async def destroy(self):
-        try:
-            await self.page.close()
-        except Exception:
-            pass
-        await self.context.close()
-        await self._pw.stop()
+        if self.page is not None:
+            try:
+                await self.page.close()
+            except Exception:
+                pass
+        if self.context is not None:
+            try:
+                await self.context.close()
+            except Exception:
+                pass
+        if self._pw is not None:
+            await self._pw.stop()
 
     async def sign_in_routine(self, redirect_url='/account/update', contains=None):
         if contains is None and redirect_url == '/account/update':
