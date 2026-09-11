@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kroger-cli"
+version = "1.0.0"
+description = "Clip coupons and earn points at Kroger-owned grocery stores"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Nikolay Shmakov", email = "hello@shmakov.net" },
+]
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "pyppeteer>=1.0",
+]
+
+[project.scripts]
+kroger = "kroger_cli.__main__:cli"
+
+[project.urls]
+Homepage = "https://github.com/Shmakov/kroger-cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kroger_cli"]
