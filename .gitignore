@@ -4,6 +4,7 @@ venv
 build
 dist
 .user-data
+.edge-profile
 *.pyc
 *.spec
 *.pkl

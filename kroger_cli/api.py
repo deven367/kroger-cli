@@ -1,17 +1,20 @@
 import asyncio
 import json
+import os
 import re
+import subprocess
 import datetime
 import kroger_cli.cli
 from kroger_cli.memoize import memoized
 from kroger_cli import helper
-from pyppeteer import launch
+from playwright.async_api import async_playwright
 
 
 class KrogerAPI:
     browser_options = {
         'headless': True,
-        'userDataDir': '.user-data',
+        'executable_path': '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        'user_data_dir': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.edge-profile'),
         'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
                  '--no-sandbox']
     }
@@ -23,6 +26,9 @@ class KrogerAPI:
 
     def __init__(self, cli):
         self.cli: kroger_cli.cli.KrogerCLI = cli
+        self._pw = None
+        self.context = None
+        self.page = None
 
     def complete_survey(self):
         # Cannot use headless mode here for some reason (sign-in cookie doesn't stick)
@@ -53,17 +59,17 @@ class KrogerAPI:
         # Model overlay pop up (might not exist)
         # Need to click on it, as it prevents me from clicking on `Order Details` link
         try:
-            await self.page.waitForSelector('.ModalitySelectorDynamicTooltip--Overlay', {'timeout': 10000})
+            await self.page.wait_for_selector('.ModalitySelectorDynamicTooltip--Overlay', timeout=10000)
             await self.page.click('.ModalitySelectorDynamicTooltip--Overlay')
         except Exception:
             pass
 
         try:
             # `See Order Details` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button', {'timeout': 10000})
+            await self.page.wait_for_selector('.PurchaseCard-top-view-details-button', timeout=10000)
             await self.page.click('.PurchaseCard-top-view-details-button a')
             # `View Receipt` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button a', {'timeout': 10000})
+            await self.page.wait_for_selector('.PurchaseCard-top-view-details-button a', timeout=10000)
             await self.page.click('.PurchaseCard-top-view-details-button a')
             content = await self.page.content()
         except Exception:
@@ -115,7 +121,7 @@ class KrogerAPI:
             return None
 
         await self.page.goto(url)
-        await self.page.waitForSelector('#Index_VisitDateDatePicker', {'timeout': 10000})
+        await self.page.wait_for_selector('#Index_VisitDateDatePicker', timeout=10000)
         # We need to manually set the date, otherwise the validation fails
         js = "() => {$('#Index_VisitDateDatePicker').datepicker('setDate', '" + survey_date + "');}"
         await self.page.evaluate(js)
@@ -124,7 +130,7 @@ class KrogerAPI:
         for i in range(35):
             current_url = self.page.url
             try:
-                await self.page.waitForSelector('#NextButton', {'timeout': 5000})
+                await self.page.wait_for_selector('#NextButton', timeout=5000)
             except Exception:
                 if 'Finish' in current_url:
                     await self.destroy()
@@ -193,8 +199,8 @@ class KrogerAPI:
         for i in range(6):
             await self.page.evaluate(js)
             await self.page.keyboard.press('End')
-            await self.page.waitFor(1000)
-        await self.page.waitFor(3000)
+            await self.page.wait_for_timeout(1000)
+        await self.page.wait_for_timeout(3000)
         await self.destroy()
         self.cli.console.print('[bold]Coupons successfully clipped to your account! :thumbs_up:[/bold]')
 
@@ -216,14 +222,40 @@ class KrogerAPI:
         return data
 
     async def init(self):
-        self.browser = await launch(self.browser_options)
-        self.page = await self.browser.newPage()
-        await self.page.setExtraHTTPHeaders(self.headers)
-        await self.page.setViewport({'width': 700, 'height': 0})
+        # Copy Edge's real profile (with saved Kroger session) to a non-default
+        # dir. Playwright's persistent context loads the saved cookies from there.
+        self._sync_edge_profile()
+        self._pw = await async_playwright().start()
+        self.context = await self._pw.chromium.launch_persistent_context(
+            self.browser_options['user_data_dir'],
+            executable_path=self.browser_options['executable_path'],
+            headless=self.browser_options['headless'],
+            args=self.browser_options['args'],
+            extra_http_headers=self.headers,
+            viewport={'width': 700, 'height': 0},
+            ignore_default_args=['--enable-automation'],
+        )
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+
+    def _sync_edge_profile(self):
+        src = os.path.expanduser('~/Library/Application Support/Microsoft Edge')
+        dst = self.browser_options['user_data_dir']
+        os.makedirs(dst, exist_ok=True)
+        # Copy Cookies + login state; skip locks and caches.
+        cmd = ['rsync', '-a', '--delete',
+               '--exclude=Cache', '--exclude=Cached Data', '--exclude=Code Cache',
+               '--exclude=GPUCache', '--exclude=Service Worker',
+               '--exclude=*.lock', '--exclude=Singleton*',
+               src + '/', dst + '/']
+        subprocess.run(cmd, check=False)
 
     async def destroy(self):
-        await self.page.close()
-        await self.browser.close()
+        try:
+            await self.page.close()
+        except Exception:
+            pass
+        await self.context.close()
+        await self._pw.stop()
 
     async def sign_in_routine(self, redirect_url='/account/update', contains=None):
         if contains is None and redirect_url == '/account/update':
@@ -251,13 +283,25 @@ class KrogerAPI:
         if not self.browser_options['headless']:
             timeout = 60000
         await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url)
-        await self.page.click('#SignIn-emailInput', {'clickCount': 3})  # Select all in the field
+
+        # Playwright's persistent context carries the Edge profile session cookie.
+        # If the signin page redirected to the target, the login form won't exist.
+        html = await self.page.content()
+        if '#SignIn-emailInput' not in html:
+            # Already signed in — check we landed on the expected page.
+            if contains is not None:
+                for item in contains:
+                    if item not in html:
+                        return False
+            return True
+
+        await self.page.click('#SignIn-emailInput', click_count=3)  # Select all in the field
         await self.page.type('#SignIn-emailInput', self.cli.username)
-        await self.page.click('#SignIn-passwordInput', {'clickCount': 3})
+        await self.page.click('#SignIn-passwordInput', click_count=3)
         await self.page.type('#SignIn-passwordInput', self.cli.password)
         await self.page.keyboard.press('Enter')
         try:
-            await self.page.waitForNavigation(timeout=timeout)
+            await self.page.wait_for_navigation(timeout=timeout)
         except Exception:
             return False
 
