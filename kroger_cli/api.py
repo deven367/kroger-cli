@@ -17,13 +17,12 @@ class KrogerAPI:
         'headless': True,
         'executable_path': os.environ.get('KROGER_BROWSER', ''),
         'user_data_dir': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.edge-profile'),
-        'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
-                 '--no-sandbox']
+        'args': ['--no-sandbox']
     }
     # Browser profile dir to copy session cookies from.
-    # Defaults to Edge's macOS location; override with KROGER_PROFILE_DIR.
+    # Defaults to Chrome's macOS location; override with KROGER_PROFILE_DIR.
     edge_profile_dir = os.environ.get('KROGER_PROFILE_DIR',
-                                      os.path.expanduser('~/Library/Application Support/Microsoft Edge'))
+                                      os.path.expanduser('~/Library/Application Support/Google/Chrome'))
     headers = {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/81.0.4044.129 Safari/537.36',
@@ -300,12 +299,15 @@ class KrogerAPI:
         timeout = 20000
         if not self.browser_options['headless']:
             timeout = 60000
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url)
+        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url,
+                             wait_until='domcontentloaded')
+        # Kroger's signin redirects to Azure AD B2C (login.kroger.com). Give it a beat.
+        await self.page.wait_for_timeout(5000)
 
-        # Playwright's persistent context carries the Edge profile session cookie.
-        # If the signin page redirected to the target, the login form won't exist.
+        # The persistent context carries the browser profile session cookie.
+        # If already signed in, the login form (B2C) won't be present.
         html = await self.page.content()
-        if '#SignIn-emailInput' not in html:
+        if 'signInName' not in html and 'password' not in html:
             # Already signed in — check we landed on the expected page.
             if contains is not None:
                 for item in contains:
@@ -313,21 +315,27 @@ class KrogerAPI:
                         return False
             return True
 
-        await self.page.click('#SignIn-emailInput', click_count=3)  # Select all in the field
-        await self.page.type('#SignIn-emailInput', self.cli.username)
-        await self.page.click('#SignIn-passwordInput', click_count=3)
-        await self.page.type('#SignIn-passwordInput', self.cli.password)
-        await self.page.keyboard.press('Enter')
+        await self.page.click('#signInName', click_count=3)  # Select all in the field
+        await self.page.type('#signInName', self.cli.username)
+        await self.page.click('#password', click_count=3)
+        await self.page.type('#password', self.cli.password)
+        await self.page.click('#continue')
         try:
             await self.page.wait_for_navigation(timeout=timeout)
         except Exception:
-            return False
+            pass
 
+        # B2C redirects back to www.kroger.com after sign-in; settle the SPA.
+        await self.page.wait_for_timeout(10000)
         if contains is not None:
             html = await self.page.content()
             for item in contains:
                 if item not in html:
-                    return False
+                    # Maybe still redirecting — one more wait before judging failure.
+                    await self.page.wait_for_timeout(10000)
+                    html = await self.page.content()
+                    if item not in html:
+                        return False
 
         return True
 
