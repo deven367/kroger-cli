@@ -1,20 +1,28 @@
 import asyncio
 import json
+import os
 import re
+import subprocess
 import datetime
 import kroger_cli.cli
 from kroger_cli.memoize import memoized
 from kroger_cli import helper
-from pyppeteer import launch
+from playwright.async_api import async_playwright
 
 
 class KrogerAPI:
+    # Path to a Chromium-family browser with a logged-in Kroger session.
+    # Override with the KROGER_BROWSER env var, or let Playwright use its own build.
     browser_options = {
         'headless': True,
-        'userDataDir': '.user-data',
-        'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
-                 '--no-sandbox']
+        'executable_path': os.environ.get('KROGER_BROWSER', ''),
+        'user_data_dir': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.edge-profile'),
+        'args': ['--no-sandbox']
     }
+    # Browser profile dir to copy session cookies from.
+    # Defaults to Chrome's macOS location; override with KROGER_PROFILE_DIR.
+    edge_profile_dir = os.environ.get('KROGER_PROFILE_DIR',
+                                      os.path.expanduser('~/Library/Application Support/Google/Chrome'))
     headers = {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/81.0.4044.129 Safari/537.36',
@@ -23,6 +31,9 @@ class KrogerAPI:
 
     def __init__(self, cli):
         self.cli: kroger_cli.cli.KrogerCLI = cli
+        self._pw = None
+        self.context = None
+        self.page = None
 
     def complete_survey(self):
         # Cannot use headless mode here for some reason (sign-in cookie doesn't stick)
@@ -53,17 +64,17 @@ class KrogerAPI:
         # Model overlay pop up (might not exist)
         # Need to click on it, as it prevents me from clicking on `Order Details` link
         try:
-            await self.page.waitForSelector('.ModalitySelectorDynamicTooltip--Overlay', {'timeout': 10000})
+            await self.page.wait_for_selector('.ModalitySelectorDynamicTooltip--Overlay', timeout=10000)
             await self.page.click('.ModalitySelectorDynamicTooltip--Overlay')
         except Exception:
             pass
 
         try:
             # `See Order Details` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button', {'timeout': 10000})
+            await self.page.wait_for_selector('.PurchaseCard-top-view-details-button', timeout=10000)
             await self.page.click('.PurchaseCard-top-view-details-button a')
             # `View Receipt` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button a', {'timeout': 10000})
+            await self.page.wait_for_selector('.PurchaseCard-top-view-details-button a', timeout=10000)
             await self.page.click('.PurchaseCard-top-view-details-button a')
             content = await self.page.content()
         except Exception:
@@ -115,7 +126,7 @@ class KrogerAPI:
             return None
 
         await self.page.goto(url)
-        await self.page.waitForSelector('#Index_VisitDateDatePicker', {'timeout': 10000})
+        await self.page.wait_for_selector('#Index_VisitDateDatePicker', timeout=10000)
         # We need to manually set the date, otherwise the validation fails
         js = "() => {$('#Index_VisitDateDatePicker').datepicker('setDate', '" + survey_date + "');}"
         await self.page.evaluate(js)
@@ -124,7 +135,7 @@ class KrogerAPI:
         for i in range(35):
             current_url = self.page.url
             try:
-                await self.page.waitForSelector('#NextButton', {'timeout': 5000})
+                await self.page.wait_for_selector('#NextButton', timeout=5000)
             except Exception:
                 if 'Finish' in current_url:
                     await self.destroy()
@@ -193,8 +204,8 @@ class KrogerAPI:
         for i in range(6):
             await self.page.evaluate(js)
             await self.page.keyboard.press('End')
-            await self.page.waitFor(1000)
-        await self.page.waitFor(3000)
+            await self.page.wait_for_timeout(1000)
+        await self.page.wait_for_timeout(3000)
         await self.destroy()
         self.cli.console.print('[bold]Coupons successfully clipped to your account! :thumbs_up:[/bold]')
 
@@ -216,14 +227,52 @@ class KrogerAPI:
         return data
 
     async def init(self):
-        self.browser = await launch(self.browser_options)
-        self.page = await self.browser.newPage()
-        await self.page.setExtraHTTPHeaders(self.headers)
-        await self.page.setViewport({'width': 700, 'height': 0})
+        # Copy the browser profile (with saved Kroger session) to a non-default
+        # dir. Playwright's persistent context loads the saved cookies from there.
+        self._sync_edge_profile()
+        self._pw = await async_playwright().start()
+        self.context = await self._pw.chromium.launch_persistent_context(
+            self.browser_options['user_data_dir'],
+            executable_path=self.browser_options['executable_path'],
+            headless=self.browser_options['headless'],
+            args=self.browser_options['args'],
+            extra_http_headers=self.headers,
+            viewport={'width': 700, 'height': 0},
+            ignore_default_args=['--enable-automation'],
+        )
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+
+    def _sync_edge_profile(self):
+        src = self.edge_profile_dir
+        dst = self.browser_options['user_data_dir']
+        if not os.path.isdir(src):
+            # No browser profile to copy — start with a fresh context (login form path).
+            return
+        os.makedirs(dst, exist_ok=True)
+        # Copy Cookies + login state; skip locks and caches.
+        cmd = ['rsync', '-a', '--delete',
+               '--exclude=Cache', '--exclude=Cached Data', '--exclude=Code Cache',
+               '--exclude=GPUCache', '--exclude=Service Worker',
+               '--exclude=*.lock', '--exclude=Singleton*',
+               src + '/', dst + '/']
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            self.cli.console.print('[yellow]Warning: could not copy browser profile — '
+                                   'session cookies may be missing.[/yellow]')
 
     async def destroy(self):
-        await self.page.close()
-        await self.browser.close()
+        if self.page is not None:
+            try:
+                await self.page.close()
+            except Exception:
+                pass
+        if self.context is not None:
+            try:
+                await self.context.close()
+            except Exception:
+                pass
+        if self._pw is not None:
+            await self._pw.stop()
 
     async def sign_in_routine(self, redirect_url='/account/update', contains=None):
         if contains is None and redirect_url == '/account/update':
@@ -250,22 +299,43 @@ class KrogerAPI:
         timeout = 20000
         if not self.browser_options['headless']:
             timeout = 60000
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url)
-        await self.page.click('#SignIn-emailInput', {'clickCount': 3})  # Select all in the field
-        await self.page.type('#SignIn-emailInput', self.cli.username)
-        await self.page.click('#SignIn-passwordInput', {'clickCount': 3})
-        await self.page.type('#SignIn-passwordInput', self.cli.password)
-        await self.page.keyboard.press('Enter')
-        try:
-            await self.page.waitForNavigation(timeout=timeout)
-        except Exception:
-            return False
+        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url,
+                             wait_until='domcontentloaded')
+        # Kroger's signin redirects to Azure AD B2C (login.kroger.com). Give it a beat.
+        await self.page.wait_for_timeout(5000)
 
+        # The persistent context carries the browser profile session cookie.
+        # If already signed in, the login form (B2C) won't be present.
+        html = await self.page.content()
+        if 'signInName' not in html and 'password' not in html:
+            # Already signed in — check we landed on the expected page.
+            if contains is not None:
+                for item in contains:
+                    if item not in html:
+                        return False
+            return True
+
+        await self.page.click('#signInName', click_count=3)  # Select all in the field
+        await self.page.type('#signInName', self.cli.username)
+        await self.page.click('#password', click_count=3)
+        await self.page.type('#password', self.cli.password)
+        await self.page.click('#continue')
+        try:
+            await self.page.wait_for_navigation(timeout=timeout)
+        except Exception:
+            pass
+
+        # B2C redirects back to www.kroger.com after sign-in; settle the SPA.
+        await self.page.wait_for_timeout(10000)
         if contains is not None:
             html = await self.page.content()
             for item in contains:
                 if item not in html:
-                    return False
+                    # Maybe still redirecting — one more wait before judging failure.
+                    await self.page.wait_for_timeout(10000)
+                    html = await self.page.content()
+                    if item not in html:
+                        return False
 
         return True
 
